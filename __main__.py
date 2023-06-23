@@ -1,13 +1,18 @@
 import os
+from configparser import ConfigParser
+
+import numpy
+import multiprocessing
 import sys
 import configparser
 import datetime
 import azure.storage.blob
+import numpy as np
 from prefect import flow, task, unmapped, get_run_logger
 from prefect_dask.task_runners import DaskTaskRunner
 from azure.identity import DefaultAzureCredential
 from azure_identity_credential_adapter import AzureIdentityCredentialAdapter
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, HttpResponseError
 from azure.storage.blob import (
     BlobServiceClient,
     BlobSasPermissions,
@@ -26,7 +31,7 @@ def read_config(path: str):
     """
     config = configparser.ConfigParser()
     config.read(path)
-    return config
+    return config, dict(x for x in config["shared_files"].items())
 
 
 @task(name="Create azure storage container")
@@ -153,7 +158,7 @@ def create_pool(config: configparser.ConfigParser):
                 start_task=batchmodels.StartTask(
                     command_line='/bin/bash -c "sudo apt-get update &&'
                     " sudo apt-get install -y python3-pip unzip &&"
-                    ' pip3 install pandas numpy rasterio"',
+                    ' pip3 install pandas numpy rasterio scipy"',
                     wait_for_success=True,
                     user_identity=batchmodels.UserIdentity(
                         auto_user=batchmodels.AutoUserSpecification(
@@ -261,7 +266,6 @@ def add_model_runs(
     """
     batch_service_client = create_batch_service_client(config)
     for parameter_file in parameter_files.items():
-
         # add model run to job
         batch_service_client.task.add(
             config["meta"]["project_name"],
@@ -291,38 +295,6 @@ def add_model_runs(
         )
 
 
-def download_container(
-    config: configparser.ConfigParser,
-    blob_service_client: azure.storage.blob.BlobServiceClient,
-    container_name: str,
-):
-    """Download all files in an azure blob storage container to local system.
-
-    :param config:
-    :param blob_service_client:
-    :param container_name:
-    :param output_blob_names:
-    :return:
-    """
-    run_id = container_name.split("-")[1]
-    output_folder = f"outputs/{run_id}"
-    try:
-        os.makedirs(output_folder)
-    except FileExistsError:
-        pass
-    for blob_name in list_output_blob_names(config, run_id):
-        if blob_service_client.get_blob_client(container_name, blob_name).exists():
-            with open(os.path.join(output_folder, blob_name), "wb") as download_file:
-                download_file.write(
-                    blob_service_client.get_container_client(container=container_name)
-                    .download_blob(blob_name)
-                    .readall()
-                )
-        else:
-            return False
-    return True
-
-
 @task
 def wait_and_download(
     config: configparser.ConfigParser,
@@ -349,7 +321,6 @@ def wait_and_download(
         hours=float(config["general"]["time_out_hrs"])
     )
     while datetime.datetime.now() < timeout_expiration:
-
         # then check if tasks are completed and download them if they have not been downloaded yet
         if len(successful_downloads + failed_downloads) < n_tasks:
             for task_id in task_ids:
@@ -401,7 +372,39 @@ def clean_up_resources(
         try:
             blob_service_client.delete_container(container_name)
         except azure.core.exceptions.ResourceNotFoundError:
-            get_run_logger().warning(f"Container {container_name} does not exist")
+            print(f"Container {container_name} does not exist")
+
+
+def download_container(
+    config: configparser.ConfigParser,
+    blob_service_client: azure.storage.blob.BlobServiceClient,
+    container_name: str,
+):
+    """Download all files in an azure blob storage container to local system.
+
+    :param config:
+    :param blob_service_client:
+    :param container_name:
+    :param output_blob_names:
+    :return:
+    """
+    run_id = container_name.split("-")[1]
+    output_folder = r"F:\wsn_eval\rasters\maatregelen\preprocessing"
+    try:
+        os.makedirs(output_folder)
+    except FileExistsError:
+        pass
+    for blob_name in list_output_blob_names(config, run_id):
+        if blob_service_client.get_blob_client(container_name, blob_name).exists():
+            with open(os.path.join(output_folder, blob_name), "wb") as download_file:
+                download_file.write(
+                    blob_service_client.get_container_client(container=container_name)
+                    .download_blob(blob_name)
+                    .readall()
+                )
+        else:
+            return False
+    return True
 
 
 @flow(task_runner=DaskTaskRunner())
@@ -454,12 +457,12 @@ def run_many_times_on_azure(config_path):
         parameter_files,
         wait_for=[job],
     )
-    run_subsets = [
-        [i for i in range(0, len(parameter_file_names), 4)],
-        [i for i in range(1, len(parameter_file_names), 4)],
-        [i for i in range(2, len(parameter_file_names), 4)],
-        [i for i in range(3, len(parameter_file_names) + 4, 4)],
-    ]
+    run_subsets = np.array_split(
+        np.array(
+            [os.path.splitext(file_name)[0] for file_name in parameter_file_names]
+        ),
+        multiprocessing.cpu_count(),
+    )
     try:
         completed_runs = wait_and_download.map(
             unmapped(config),
