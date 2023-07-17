@@ -327,6 +327,7 @@ def wait_and_download(
         hours=float(config["general"]["time_out_hrs"])
     )
     while datetime.datetime.now() < timeout_expiration:
+
         # then check if tasks are completed and download them if they have not been downloaded yet
         if len(successful_downloads + failed_downloads) < n_tasks:
             for task_id in task_ids:
@@ -340,7 +341,7 @@ def wait_and_download(
                 ):
                     get_run_logger().info(f"{task_id} is completed, downloading...")
                     if (
-                        task.execution_info.failure_info is not None
+                        task.execution_info.failure_info is None
                         and download_container(
                             config, blob_service_client, f"output-{task_id}"
                         )
@@ -352,7 +353,7 @@ def wait_and_download(
                         )
                     else:
                         failed_downloads.append(task_id)
-            time.sleep(3)
+
         else:
             get_run_logger().info("All runs completed, hooray!")
             get_run_logger().info(
@@ -495,7 +496,7 @@ def run_many_times_on_azure(config_path):
         # Download output and clean up everything
         clean_up_resources(
             config,
-            input_container_names,
+            [],
             wait_for=[completed_runs],
         )
     except (batchmodels.BatchErrorException, azure.core.exceptions):
