@@ -304,7 +304,7 @@ def add_model_runs(
 @task
 def wait_and_download(
     config: ConfigParser,
-    task_ids: list,
+    task_ids: np.array,
 ):
     """Returns when all tasks in the specified job reach the Completed state.
 
@@ -347,13 +347,15 @@ def wait_and_download(
                         )
                     ):
                         successful_downloads.append(task_id)
-                        blob_service_client.delete_container(f"output-{task_id}")
                         batch_service_client.task.delete(
                             config["meta"]["project_name"], task_id
                         )
+                        blob_service_client.delete_container(f"output-{task_id}")
+                        task_ids = task_ids[task_ids != task_id]
                     else:
                         failed_downloads.append(task_id)
-
+                        task_ids = task_ids[task_ids != task_id]
+            time.sleep(10)
         else:
             get_run_logger().info("All runs completed, hooray!")
             get_run_logger().info(
@@ -494,11 +496,11 @@ def run_many_times_on_azure(config_path):
             get_run_logger().warning(f"Following runs failed: {run}")
 
         # Download output and clean up everything
-        clean_up_resources(
-            config,
-            [],
-            wait_for=[completed_runs],
-        )
+        # clean_up_resources(
+        #     config,
+        #     [],
+        #     wait_for=[completed_runs],
+        # )
     except (batchmodels.BatchErrorException, azure.core.exceptions):
         create_batch_service_client(config).pool.delete(config["meta"]["project_name"])
 
