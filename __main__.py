@@ -343,9 +343,9 @@ def wait_and_download(
                         batch_service_client.task.delete(
                             config["meta"]["project_name"], task_id
                         )
-                        blob_service_client.delete_container(f"output-{task_id}")
                     else:
                         failed_downloads.append(task_id)
+                    blob_service_client.delete_container(f"output-{task_id}")
                     task_ids = task_ids[task_ids != task_id]
             time.sleep(10)
         else:
@@ -490,7 +490,7 @@ def run_many_times_on_azure(config_path):
         # Download output and clean up everything
         clean_up_resources(
             config,
-            output_container_names,
+            [],
             wait_for=[completed_runs],
         )
     except (batchmodels.BatchErrorException, azure.core.exceptions):
