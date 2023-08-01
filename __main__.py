@@ -1,17 +1,19 @@
 import os
 from configparser import ConfigParser
-
-import numpy
+import time
 import multiprocessing
 import sys
-import configparser
 import datetime
 import azure.storage.blob
 import numpy as np
 from prefect import flow, task, unmapped, get_run_logger
 from prefect_dask.task_runners import DaskTaskRunner
 from azure.identity import DefaultAzureCredential
-from azure_identity_credential_adapter import AzureIdentityCredentialAdapter
+
+try:
+    from azure_identity_credential_adapter import AzureIdentityCredentialAdapter
+except ModuleNotFoundError:
+    from .azure_identity_credential_adapter import AzureIdentityCredentialAdapter
 from azure.core.exceptions import ResourceExistsError, HttpResponseError
 from azure.storage.blob import (
     BlobServiceClient,
@@ -29,7 +31,7 @@ def read_config(path: str):
     :param path:
     :return:
     """
-    config = configparser.ConfigParser()
+    config = ConfigParser()
     config.read(path)
     return config, dict(x for x in config["shared_files"].items())
 
@@ -47,9 +49,11 @@ def create_containers(blob_service_client: BlobServiceClient, names: list):
             blob_service_client.create_container(name)
         except ResourceExistsError:
             pass
+        except HttpResponseError as e:
+            raise HttpResponseError(f"{e.reason} : {name}")
 
 
-def create_blob_service_client(config: configparser.ConfigParser):
+def create_blob_service_client(config: ConfigParser):
     """You pass butter
 
     :param config:
@@ -63,7 +67,7 @@ def create_blob_service_client(config: configparser.ConfigParser):
 
 def upload_file_to_container(
     blob_service_client: BlobServiceClient,
-    config: configparser.ConfigParser,
+    config: ConfigParser,
     container_name: str,
     file_path: str,
     identifier: str,
@@ -120,7 +124,7 @@ def upload_files(config, container_name, file_paths: list, identifiers: list):
     )
 
 
-def create_batch_service_client(config: configparser.ConfigParser):
+def create_batch_service_client(config: ConfigParser):
     credential = AzureIdentityCredentialAdapter(
         DefaultAzureCredential(exclude_interactive_browser_credential=True),
         resource_id="https://batch.core.windows.net//.default",
@@ -131,7 +135,7 @@ def create_batch_service_client(config: configparser.ConfigParser):
 
 
 @task
-def create_pool(config: configparser.ConfigParser):
+def create_pool(config: ConfigParser, resource_file):
     """Create a pool of nodes to run models on.
 
     :param config:
@@ -145,20 +149,22 @@ def create_pool(config: configparser.ConfigParser):
                 id=config["meta"]["project_name"],
                 virtual_machine_configuration=batchmodels.VirtualMachineConfiguration(
                     image_reference=batchmodels.ImageReference(
-                        publisher="Canonical",
-                        offer="0001-com-ubuntu-server-focal",
-                        sku="20_04-lts-gen2",
+                        publisher="microsoftwindowsserver",
+                        offer="windowsserver",
+                        sku="2022-datacenter-core",
                         version="latest",
                     ),
-                    node_agent_sku_id="batch.node.ubuntu 20.04",
+                    node_agent_sku_id="batch.node.windows amd64",
                 ),
                 vm_size=config["pool"]["size"],
                 target_dedicated_nodes=config["pool"]["count"],
                 target_low_priority_nodes=config["pool"]["low_priority_nodes"],
                 start_task=batchmodels.StartTask(
-                    command_line='/bin/bash -c "sudo apt-get update &&'
-                    " sudo apt-get install -y python3-pip unzip &&"
-                    ' pip3 install pandas numpy rasterio scipy"',
+                    command_line="cmd /c echo Starting python install &"
+                    ".\python-3.11.4-amd64.exe /passive InstallAllUsers=1 PrependPath=1 &&"
+                    "echo Python install succesful, installing packages &"
+                    '"C:\Program Files\Python311\python.exe" -m pip install numpy pandas rasterio',
+                    resource_files=[resource_file],
                     wait_for_success=True,
                     user_identity=batchmodels.UserIdentity(
                         auto_user=batchmodels.AutoUserSpecification(
@@ -174,7 +180,7 @@ def create_pool(config: configparser.ConfigParser):
 
 
 @task
-def create_job(config: configparser.ConfigParser):
+def create_job(config: ConfigParser):
     """
 
     :param config:
@@ -189,11 +195,11 @@ def create_job(config: configparser.ConfigParser):
     try:
         batch_service_client.job.add(job)
     except batchmodels.BatchErrorException:
-        batch_service_client.job.delete(job)
+        batch_service_client.job.delete(config["meta"]["project_name"])
         batch_service_client.job.add(job)
 
 
-def list_output_blob_names(config: configparser.ConfigParser, identifier: str):
+def list_output_blob_names(config: ConfigParser, identifier: str):
     """Make a list of model output files which are to be uploaded to output container.
 
     :param config:
@@ -207,7 +213,7 @@ def list_output_blob_names(config: configparser.ConfigParser, identifier: str):
 
 
 def build_command(
-    config: configparser.ConfigParser,
+    config: ConfigParser,
     shared_files: dict[str : batchmodels.ResourceFile],
     parameter_file: tuple[str : batchmodels.ResourceFile],
 ):
@@ -225,7 +231,7 @@ def build_command(
     )
 
 
-def build_container_sas_url(config: configparser.ConfigParser, container_name: str):
+def build_container_sas_url(config: ConfigParser, container_name: str):
     """Create sas url for use when uploading model output to output container.
 
     :param config:
@@ -250,7 +256,7 @@ def build_container_sas_url(config: configparser.ConfigParser, container_name: s
 
 @task(name="Add model run to job as task")
 def add_model_runs(
-    config: configparser.ConfigParser,
+    config: ConfigParser,
     shared_files: dict[str : batchmodels.ResourceFile],
     parameter_files: dict[str : batchmodels.ResourceFile],
 ):
@@ -297,8 +303,8 @@ def add_model_runs(
 
 @task
 def wait_and_download(
-    config: configparser.ConfigParser,
-    task_ids: list,
+    config: ConfigParser,
+    task_ids: np.array,
 ):
     """Returns when all tasks in the specified job reach the Completed state.
 
@@ -324,24 +330,24 @@ def wait_and_download(
         # then check if tasks are completed and download them if they have not been downloaded yet
         if len(successful_downloads + failed_downloads) < n_tasks:
             for task_id in task_ids:
-                if (
-                    (
-                        batch_service_client.task.get(
-                            config["meta"]["project_name"], task_id
-                        ).state
-                        == batchmodels.TaskState.completed
-                    )
-                    and task_id not in successful_downloads
-                    and task_id not in failed_downloads
-                ):
+                task = batch_service_client.task.get(
+                    config["meta"]["project_name"], task_id
+                )
+                if task.state == batchmodels.TaskState.completed:
                     get_run_logger().info(f"{task_id} is completed, downloading...")
-                    if download_container(
+                    download_succesful = download_container(
                         config, blob_service_client, f"output-{task_id}"
-                    ):
+                    )
+                    if task.execution_info.failure_info is None and download_succesful:
                         successful_downloads.append(task_id)
-                        blob_service_client.delete_container(f"output-{task_id}")
+                        batch_service_client.task.delete(
+                            config["meta"]["project_name"], task_id
+                        )
                     else:
                         failed_downloads.append(task_id)
+                    blob_service_client.delete_container(f"output-{task_id}")
+                    task_ids = task_ids[task_ids != task_id]
+            time.sleep(10)
         else:
             get_run_logger().info("All runs completed, hooray!")
             get_run_logger().info(
@@ -352,7 +358,7 @@ def wait_and_download(
 
 @task
 def clean_up_resources(
-    config: configparser.ConfigParser,
+    config: ConfigParser,
     containers: list,
 ):
     """Delete job, pool and all containers.
@@ -367,6 +373,7 @@ def clean_up_resources(
     blob_service_client = create_blob_service_client(config)
 
     # Clean up Batch resources
+    batch_service_client.job.delete(config["meta"]["project_name"])
     batch_service_client.pool.delete(config["meta"]["project_name"])
     for container_name in containers:
         try:
@@ -376,7 +383,7 @@ def clean_up_resources(
 
 
 def download_container(
-    config: configparser.ConfigParser,
+    config: ConfigParser,
     blob_service_client: azure.storage.blob.BlobServiceClient,
     container_name: str,
 ):
@@ -389,7 +396,7 @@ def download_container(
     :return:
     """
     run_id = container_name.split("-")[1]
-    output_folder = r"F:\wsn_eval\rasters\maatregelen\preprocessing"
+    output_folder = config["general"]["output_directory"]
     try:
         os.makedirs(output_folder)
     except FileExistsError:
@@ -427,27 +434,35 @@ def run_many_times_on_azure(config_path):
 
     # upload shared files
     shared_files = upload_files(
-        config,
-        f"{config['meta']['project_name']}-shared-files",
-        shared_file_paths.values(),
-        shared_file_paths.keys(),
+        config=config,
+        container_name=f"{config['meta']['project_name']}-shared-files",
+        file_paths=shared_file_paths.values(),
+        identifiers=shared_file_paths.keys(),
         wait_for=[containers_created],
     )
 
     # upload parameter files
     parameter_files = upload_files(
-        config,
-        f"{config['meta']['project_name']}-parameter-files",
-        [
+        config=config,
+        container_name=f"{config['meta']['project_name']}-parameter-files",
+        file_paths=[
             f"{os.path.join(config['parameter_files']['directory'],file)}"
             for file in parameter_file_names
         ],
-        [os.path.splitext(file)[0] for file in parameter_file_names],
+        identifiers=[os.path.splitext(file)[0] for file in parameter_file_names],
         wait_for=[containers_created],
     )
 
     # Create batch service client, make a pool and add a job to it.
-    pool = create_pool(config)
+    create_containers(blob_service_client, ["python-executable"])
+    _, python_executable = upload_file_to_container(
+        blob_service_client=blob_service_client,
+        config=config,
+        container_name="python-executable",
+        file_path=r"C:\Users\biers004\Downloads\python-3.11.4-amd64.exe",
+        identifier="python-executable",
+    )
+    pool = create_pool(config, python_executable)
     job = create_job(config, wait_for=[pool])
 
     # Add model runs to job and wait for them to be completed
@@ -475,7 +490,7 @@ def run_many_times_on_azure(config_path):
         # Download output and clean up everything
         clean_up_resources(
             config,
-            input_container_names,
+            [],
             wait_for=[completed_runs],
         )
     except (batchmodels.BatchErrorException, azure.core.exceptions):
