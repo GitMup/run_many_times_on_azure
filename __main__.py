@@ -195,7 +195,7 @@ def create_job(config: ConfigParser):
     try:
         batch_service_client.job.add(job)
     except batchmodels.BatchErrorException:
-        batch_service_client.job.delete(job)
+        batch_service_client.job.delete(config["meta"]["project_name"])
         batch_service_client.job.add(job)
 
 
@@ -327,34 +327,26 @@ def wait_and_download(
         hours=float(config["general"]["time_out_hrs"])
     )
     while datetime.datetime.now() < timeout_expiration:
-
         # then check if tasks are completed and download them if they have not been downloaded yet
         if len(successful_downloads + failed_downloads) < n_tasks:
             for task_id in task_ids:
                 task = batch_service_client.task.get(
                     config["meta"]["project_name"], task_id
                 )
-                if (
-                    (task.state == batchmodels.TaskState.completed)
-                    and task_id not in successful_downloads
-                    and task_id not in failed_downloads
-                ):
+                if task.state == batchmodels.TaskState.completed:
                     get_run_logger().info(f"{task_id} is completed, downloading...")
-                    if (
-                        task.execution_info.failure_info is None
-                        and download_container(
-                            config, blob_service_client, f"output-{task_id}"
-                        )
-                    ):
+                    download_succesful = download_container(
+                        config, blob_service_client, f"output-{task_id}"
+                    )
+                    if task.execution_info.failure_info is None and download_succesful:
                         successful_downloads.append(task_id)
                         batch_service_client.task.delete(
                             config["meta"]["project_name"], task_id
                         )
                         blob_service_client.delete_container(f"output-{task_id}")
-                        task_ids = task_ids[task_ids != task_id]
                     else:
                         failed_downloads.append(task_id)
-                        task_ids = task_ids[task_ids != task_id]
+                    task_ids = task_ids[task_ids != task_id]
             time.sleep(10)
         else:
             get_run_logger().info("All runs completed, hooray!")
@@ -381,6 +373,7 @@ def clean_up_resources(
     blob_service_client = create_blob_service_client(config)
 
     # Clean up Batch resources
+    batch_service_client.job.delete(config["meta"]["project_name"])
     batch_service_client.pool.delete(config["meta"]["project_name"])
     for container_name in containers:
         try:
@@ -441,36 +434,35 @@ def run_many_times_on_azure(config_path):
 
     # upload shared files
     shared_files = upload_files(
-        config,
-        f"{config['meta']['project_name']}-shared-files",
-        shared_file_paths.values(),
-        shared_file_paths.keys(),
+        config=config,
+        container_name=f"{config['meta']['project_name']}-shared-files",
+        file_paths=shared_file_paths.values(),
+        identifiers=shared_file_paths.keys(),
         wait_for=[containers_created],
     )
 
     # upload parameter files
     parameter_files = upload_files(
-        config,
-        f"{config['meta']['project_name']}-parameter-files",
-        [
+        config=config,
+        container_name=f"{config['meta']['project_name']}-parameter-files",
+        file_paths=[
             f"{os.path.join(config['parameter_files']['directory'],file)}"
             for file in parameter_file_names
         ],
-        [os.path.splitext(file)[0] for file in parameter_file_names],
+        identifiers=[os.path.splitext(file)[0] for file in parameter_file_names],
         wait_for=[containers_created],
     )
 
     # Create batch service client, make a pool and add a job to it.
     create_containers(blob_service_client, ["python-executable"])
     _, python_executable = upload_file_to_container(
-        blob_service_client,
-        config,
-        "python-executable",
-        r"C:\Users\biers004\Downloads\python-3.11.4-amd64.exe",
-        "python-executable",
+        blob_service_client=blob_service_client,
+        config=config,
+        container_name="python-executable",
+        file_path=r"C:\Users\biers004\Downloads\python-3.11.4-amd64.exe",
+        identifier="python-executable",
     )
     pool = create_pool(config, python_executable)
-
     job = create_job(config, wait_for=[pool])
 
     # Add model runs to job and wait for them to be completed
@@ -496,11 +488,11 @@ def run_many_times_on_azure(config_path):
             get_run_logger().warning(f"Following runs failed: {run}")
 
         # Download output and clean up everything
-        # clean_up_resources(
-        #     config,
-        #     [],
-        #     wait_for=[completed_runs],
-        # )
+        clean_up_resources(
+            config,
+            output_container_names,
+            wait_for=[completed_runs],
+        )
     except (batchmodels.BatchErrorException, azure.core.exceptions):
         create_batch_service_client(config).pool.delete(config["meta"]["project_name"])
 
